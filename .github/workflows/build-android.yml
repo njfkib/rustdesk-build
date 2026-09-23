@@ -1,53 +1,27 @@
 name: build-custom-client-android
-# Build a RustDesk client. Build inputs are provided at build time.
+# 编译一个把自建服务器地址和 Key 写死、且隐藏网络设置界面的 RustDesk 客户端(Android .apk / .aab)
+# 改编自 njfkib/rustdesk-build .github/workflows/build-android.yml;源码源改官方 1.4.9,免 PAT。
+# 与 njfkib 的差异:custom.txt 通过 apply-config.sh 打补丁的 MainService.kt
+# (readCustomClientConfig() 读 assets/custom.txt)注入,而非在 CI 里内嵌 base64。
 
 on:
   workflow_dispatch:
     inputs:
-      taskid:
-        description: '构建任务 id'
-        required: true
-        type: string
-      gen:
-        description: '(optional)'
-        required: false
-        type: string
-        default: ''
-      callback_url:
-        description: '(optional)'
-        required: false
-        type: string
-        default: ''
-      # ── rdauth 给所有平台 workflow 统一派发下面 4 个 dispatch 输入;必须【全部声明】,
-      #    否则未声明的输入会让 workflow_dispatch 直接 422 拒绝。
-      #    android 只消费 arch / package_format;distro(linux 包格式)、msi(windows)
-      #    在 android 无意义,声明后忽略(仅为过 dispatch 校验)。
       arch:
-        description: 'CPU arch: empty/aarch64/armv7/x86_64 (empty=aarch64)'
-        required: false
-        type: string
-        default: ''
-      distro:
-        description: '(linux only; ignored on android)'
+        description: 'CPU 架构: 空/aarch64 → arm64-v8a;armv7 → armeabi-v7a;x86_64 → x86_64'
         required: false
         type: string
         default: ''
       package_format:
-        description: 'android package: empty/apk/aab (empty=apk)'
+        description: '包格式: 空/apk → apk(split-per-abi);aab → appbundle'
         required: false
         type: string
         default: ''
-      msi:
-        description: '(windows only; ignored on android)'
-        required: false
-        type: string
-        default: 'false'
 
 permissions:
-  contents: write
+  contents: read
 
-# RUST 1.75 / FLUTTER 3.24.5 / NDK r28c / cargo-ndk 3.1.2 / VCPKG 120deac...。
-# VERSION 固定 1.4.9(我们的源码版本),UPSTREAM_REF 用于补齐资源。
+# RUST 1.75 / FLUTTER 3.24.5 / NDK r28c / cargo-ndk 3.1.2 / VCPKG 120deac...
 env:
   RUST_VERSION: "1.75"
   FLUTTER_VERSION: "3.24.5"
@@ -56,29 +30,19 @@ env:
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "1.4.9"
-  UPSTREAM_REF: "1.4.9" # 补齐资源用的 pin 死上游 tag
 
 jobs:
-  # ── 先生成 flutter_rust_bridge(reusable workflow,见 ./.github/workflows/bridge.yml)──
-  #    与 linux build.yml 一字不差。
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
-    secrets: inherit
     with:
       version: '1.4.9'
 
-  # ── 主编译:android <arch> → .apk / .aab ───────────────────────────────────────────
-  #    arch/package_format 由 rdauth 通过 dispatch 传入;空值走 aarch64 + apk(向后兼容)。
   build:
     needs: generate-bridge
     name: build rustdesk android ${{ inputs.arch || 'aarch64' }}
     runs-on: ubuntu-24.04
-    outputs:
-      file_url: ${{ steps.release.outputs.file_url }}
     steps:
-      # ── 把 inputs.arch / inputs.package_format 解析成一组 env,供后续所有步骤消费 ──
-      #    空 arch → aarch64;空/apk → apk;aab → appbundle。未知值直接 fail 掉。
-      #    ANDROID_ABI 同时就是 --split-per-abi 产物名里的 abi 段(arm64-v8a/armeabi-v7a/x86_64)。
+      # ── inputs.arch / inputs.package_format → env(参数化,不写死 arm64)──
       - name: Resolve build params
         shell: bash
         run: |
@@ -111,147 +75,78 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "resolved: arch=$ARCH target=$RUST_TARGET abi=$ANDROID_ABI platform=$TARGET_PLATFORM fmt=$PKG_FMT"
 
-      # ══════════════════════════════════════════════════════════════════════════════
-      # 前半段 = 通用外壳,从 linux build.yml 逐字照搬(只改平台无关处)
-      # ══════════════════════════════════════════════════════════════════════════════
+      # 本仓库(apply-config.sh + config.json)checkout 到 custom/ 子目录
+      - name: Checkout custom build kit
+        uses: actions/checkout@v4
+        with:
+          path: custom
 
-      #   源码 clone 到 workspace 根目录(空目录,可直接 clone 进 .);patch/config → /tmp。
-      - name: Fetch build inputs
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
-          PRIV: ${{ secrets.PRIVATE_REPO }}
+      # 官方源码 → workspace 根 + submodule(hbb_common)
+      - name: Clone RustDesk ${VERSION} source
         run: |
           set -e
-          B="https://x-access-token:${GH_TOKEN}@github.com/${PRIV}.git"
-          # 源码 → workspace 根
-          git clone --depth 1 -b code "$B" .
-          # patch / config → /tmp
-          git clone --depth 1 -b patch  "$B" /tmp/patch
-          git clone --depth 1 -b config "$B" /tmp/cfg
-          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
-          cp "/tmp/cfg/configs/${{ inputs.taskid }}${SUF}.json" ./config.json
-          # 敏感配置值加掩码:appName/host/key 及其派生,一律不进公开 CI 日志
-          for _v in "$(jq -r '.appName // empty' config.json)" "$(jq -r '.server.host // empty' config.json)" "$(jq -r '.server.key // empty' config.json)"; do
+          git clone --depth 1 --branch ${VERSION} https://github.com/rustdesk/rustdesk.git .
+          git -c submodule."libs/hbb_common".shallow=true submodule update --init --depth 1
+          echo "source cloned: $(git rev-parse --short HEAD)"
+          test -f libs/hbb_common/src/config.rs && echo "submodule hbb_common OK"
+
+      # 从 config.json 计算 appname / filename;敏感值加掩码
+      - name: Compute appname/filename from config.json
+        shell: bash
+        run: |
+          set -e
+          APP=$(jq -r '.appName // "RustDesk"' custom/config.json)
+          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
+          echo "appname=$APP"   >> "$GITHUB_ENV"
+          echo "filename=$SAFE" >> "$GITHUB_ENV"
+          # androidAppId 缺省则保持原包名(下方改包名步骤有 if 守卫,不改就跳过)
+          echo "androidappid=$(jq -r '.androidAppId // "com.carriez.flutter_hbb"' custom/config.json)" >> "$GITHUB_ENV"
+          for _v in "$(jq -r '.appName // empty' custom/config.json)" "$(jq -r '.server.host // empty' custom/config.json)" "$(jq -r '.server.key // empty' custom/config.json)"; do
             [ -n "$_v" ] && echo "::add-mask::$_v"
           done
 
-      #   android 编译/打包会用到 res/*.png|svg、flutter/assets/*、.github/patches、
-      #   flutter/ndk_*.sh、flutter/build_android_deps.sh 等,不补齐必然失败。
-      - name: Restore resources
+      # ── 核心注入:host/key 写死 + 删验签 + MainService.kt 读 assets/custom.txt + 生成 custom.txt ──
+      - name: Apply configuration + generate custom.txt
+        shell: bash
         run: |
           set -e
-          git clone --depth 1 --branch "${UPSTREAM_REF}" https://github.com/rustdesk/rustdesk.git /tmp/up
-          rsync -a --ignore-existing --exclude='.git' /tmp/up/ ./
-          rm -rf /tmp/up
-          echo "已补齐资源;抽查: $(ls -1 res/scalable.svg flutter/ndk_arm64.sh flutter/build_android_deps.sh 2>&1 | tr '\n' ' ')"
+          bash ./custom/patch/apply-config.sh "$PWD" "$PWD/custom/config.json"
+          echo "--- 注入后抽查 ---"
+          grep -n 'RENDEZVOUS_SERVERS\|RS_PUB_KEY' libs/hbb_common/src/config.rs | head -4
+          grep -c 'signMode=delete' src/common.rs
+          grep -n 'readCustomClientConfig' flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
+          ls -l custom.txt
 
-      #   apply-config 注入 host/key/api/appname/公司名/官网/下载链接/验签处理,生成
-      #   ./_custom_client.json。android 平台专属改名(manifest/label/appid)另由下方步骤补。
-      - name: Apply configuration
+      # ── 把 custom.txt 放进 flutter assets(pubspec.yaml 已声明 assets/ 目录,任意文件打进 APK)──
+      - name: Embed custom.txt into flutter assets
+        shell: bash
         run: |
-          set -e
-          chmod +x /tmp/patch/*.sh
-          /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
+          mkdir -p flutter/assets
+          cp ./custom.txt ./flutter/assets/custom.txt
+          ls -l ./flutter/assets/custom.txt
 
-      #   apply-icons.sh 依赖 ImageMagick(convert/magick)生成 res/icon.ico/各尺寸 png,
-      #   必须在下方 Apply icons 之前装好(ubuntu runner,同 linux)。
-      - name: Install ImageMagick
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y imagemagick
-
-      #   把控制台上传的应用图标/首页 Logo(config.json 的 base64)换进源码。
-      #   必须在 Restore resources(补齐上游默认图标)之后跑,才能用自定义图标覆盖上游默认图标。
-      - name: Apply icons
-        run: |
-          set -e
-          bash /tmp/patch/apply-icons.sh "$PWD" "$PWD/config.json"
-
-      #   signMode=delete:apply-config 已删验签,直接 base64 即可被客户端接受。
-      #   android 侧不 file-read custom_.txt,而是把这段 base64 内嵌进 native(见下方 Embed 步)。
-      - name: Generate config blob
-        run: |
-          set -e
-          MODE=$(jq -r '.signMode // "delete"' config.json)
-          if [ "$MODE" = "swapkey" ]; then
-            echo "::warning::signMode=swapkey 尚未实现签名(需 SIGN_PRIVKEY);v0 先按未签处理"
-          fi
-          base64 -w0 ./_custom_client.json > ./custom_.txt
-          echo "custom_.txt 生成: $(wc -c < ./custom_.txt) 字节"
-
-      # ── Restore bridge files:从 generate-bridge 的 bridge-artifact 下载还原(照抄 linux)──
-      #   钉 v4(配 bridge.yml 的 upload-artifact@v4)。生成文件落回 ./src 与 ./flutter/lib,
-      #   flutter build 必须先有这些桥接文件,否则缺代码而失败。
-      - name: Restore bridge files
-        uses: actions/download-artifact@v4
-        with:
-          name: bridge-artifact
-          path: ./
-
-      # ══════════════════════════════════════════════════════════════════════════════
-      # ══════════════════════════════════════════════════════════════════════════════
-
-      #   供 android native 内嵌与 assets 使用。
-      - name: Build step
-        run: |
-          set -e
-          APP=$(jq -r '.appName // "RustDesk"' config.json)
-          echo "appname=$APP" >> $GITHUB_ENV
-          # 文件名安全化(只留字母数字 . _ -);空则回退 custom
-          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
-          echo "filename=$SAFE" >> $GITHUB_ENV
-          # compname:apply-config 已把公司名写进它覆盖的共享文件(Cargo/main.rs/desktop_setting);
-          #          此处派生仅备用,android 侧无独立公司名串。
-          echo "compname=$(jq -r '.companyName // "" ' config.json)" >> $GITHUB_ENV
-          # androidAppId 缺省则保持原包名(下方改包名步骤有 if 守卫,不改就跳过)
-          echo "androidappid=$(jq -r '.androidAppId // "com.carriez.flutter_hbb"' config.json)" >> $GITHUB_ENV
-          # custom = base64 配置(单行、base64 字母表无 shell/sed 特殊字符)
-          echo "custom=$(cat ./custom_.txt)" >> $GITHUB_ENV
-
-      #   仅 appName != RustDesk 时执行;来源改为 env.appname(从 config.json 派生)。
+      # ── 仅 appName != RustDesk 时执行(channel: 默认 RustDesk 保持原样,不引入风险)──
       - name: change appname to custom (android/flutter)
         if: env.appname != 'RustDesk'
         continue-on-error: true
         shell: bash
         run: |
-          sed -i -e 's|RustDesk|${{ env.appname }}|' ./flutter/android/app/src/main/res/values/strings.xml
-          sed -i -e "s|title: 'RustDesk'|title: '${{ env.appname }}'|" ./flutter/lib/main.dart
-          sed -i -e "s|return 'RustDesk';|return '${{ env.appname }}';|" ./flutter/lib/web/bridge.dart
-          sed -i 's|RustDesk|${{ env.appname }}|' ./flutter/lib/main.dart
-          sed -i 's|android:label="RustDesk"|android:label="${{ env.appname }}"|' ./flutter/android/app/src/main/AndroidManifest.xml
-          sed -i 's|android:label="RustDesk Input"|android:label="${{ env.appname }} Input"|' ./flutter/android/app/src/main/AndroidManifest.xml
-          sed -i 's|RustDesk is Open|${{ env.appname }} is Open|' ./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/BootReceiver.kt
-          sed -i 's|Show Rustdesk|Show ${{ env.appname }}|' ./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/FloatingWindowService.kt
-          sed -i 's|"RustDesk"|"${{ env.appname }}"|' ./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
-          sed -i 's|"RustDesk Service|"${{ env.appname }} Service|' ./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
-
-      #   Kotlin FFI.startServer 与 Dart native_model 默认传 "";内嵌后 read_custom_client()
-      #   才会跑、预置密码/权限/覆盖设置生效。host/key 已由 apply-config 硬编,故此步非致命。
-      - name: Embed custom config for Android
-        continue-on-error: true
-        shell: bash
-        run: |
-          KOTLIN=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
-          DART=./flutter/lib/models/native_model.dart
-          sed -i "s|FFI.startServer(configPath, \"\")|FFI.startServer(configPath, \"${{ env.custom }}\")|" "$KOTLIN"
-          sed -i "s|customClientConfig: '',|customClientConfig: '${{ env.custom }}',|" "$DART"
-          echo "--- verify ---"
-          grep -n 'FFI.startServer(configPath' "$KOTLIN" | sed 's/\(.\{80\}\).*/\1.../' || true
-          grep -n 'customClientConfig:' "$DART" | sed 's/\(.\{80\}\).*/\1.../' || true
+          sed -i -e 's|RustDesk|${{ env.appname }}|' ./flutter/android/app/src/main/res/values/strings.xml || true
+          sed -i -e "s|title: 'RustDesk'|title: '${{ env.appname }}'|" ./flutter/lib/main.dart || true
+          sed -i 's|android:label="RustDesk"|android:label="${{ env.appname }}"|' ./flutter/android/app/src/main/AndroidManifest.xml || true
 
       - name: change app id to custom
         if: env.androidappid != 'com.carriez.flutter_hbb'
         continue-on-error: true
         shell: bash
         run: |
-          sed -i -e 's|com.carriez.flutter_hbb|${{ env.androidappid }}|' ./flutter/android/app/build.gradle
+          sed -i -e 's|com.carriez.flutter_hbb|${{ env.androidappid }}|' ./flutter/android/app/build.gradle || true
 
       - name: Remove scam alert on Android
         continue-on-error: true
         shell: bash
         run: |
-          sed -i 's/bind.mainGetLocalOption(key:\s*"show-scam-warning")/"N"/g' ./flutter/lib/mobile/pages/server_page.dart
+          sed -i 's/bind.mainGetLocalOption(key:\s*"show-scam-warning")/"N"/g' ./flutter/lib/mobile/pages/server_page.dart || true
 
       - name: Export GitHub Actions cache environment variables
         uses: actions/github-script@v7
@@ -282,7 +177,6 @@ jobs:
                git \
                g++ \
                g++-multilib \
-               imagemagick \
                libayatana-appindicator3-dev \
                libasound2-dev \
                libc6-dev \
@@ -316,20 +210,11 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
       # ── flutter 3.24.5 的 dropdown_menu enableFilter 补丁(上游 1.4.9 自家 CI 也打)──
-      #   补丁文件由"资源补齐"从上游 1.4.9 补进 .github/patches;host 路径 github.workspace 可靠。
       - name: Patch flutter
         continue-on-error: true
         run: |
           cd $(dirname $(dirname $(which flutter)))
-          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
-
-      #   从 res/icon.png(apply-icons 已换成自定义图标)重生成 android mipmap 等各平台 flutter 图标;
-      #   pubspec flutter_icons.image_path 指向 ../res/icon.png。best-effort:装不上/跑不通也不阻断构建
-      #   (Rust 侧 res/icon.ico 已给了 exe/托盘图标)。须在 flutter 安装之后、真正 build 之前。
-      - name: Regenerate flutter icons
-        continue-on-error: true
-        run: |
-          cd flutter && flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons || true)
+          [[ "3.24.5" == ${{ env.FLUTTER_VERSION }} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff || true
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
@@ -344,7 +229,7 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
 
-      # ── android 原生依赖(opus/libyuv 等,经 flutter/build_android_deps.sh + vcpkg)──────
+      # ── android 原生依赖(opus/libyuv 等,经 flutter/build_android_deps.sh + vcpkg)──
       - name: Install vcpkg dependencies
         shell: bash
         run: |
@@ -360,6 +245,12 @@ jobs:
             exit 1
           fi
 
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -372,7 +263,7 @@ jobs:
           prefix-key: rustdesk-lib-cache-android
           key: ${{ env.RUST_TARGET }}
 
-      #   按 inputs.arch 解析出的 NDK 脚本 / target / abi 编 native lib(参数化,不再写死 arm64)。
+      # 编 native lib(参数化,不写死 arm64)
       - name: Build rustdesk lib
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -384,9 +275,7 @@ jobs:
           mkdir -p ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}
           cp ./target/${{ env.RUST_TARGET }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/librustdesk.so
 
-      #   ★signingConfigs.release→debug:用 flutter 默认 debug keystore 出可安装 apk;aab 同样 debug 签。
-      #   arch → --target-platform + libc++/rust .so 的 abi 目录 + apk 产物名的 abi 段,均由 env 解析。
-      #   package_format:apk → flutter build apk --split-per-abi;aab → flutter build appbundle。
+      # ★signingConfigs.release→debug:用 flutter 默认 debug keystore 出可安装 apk;aab 同样 debug 签。
       - name: Build rustdesk (apk/aab)
         shell: bash
         env:
@@ -403,10 +292,8 @@ jobs:
           mkdir -p ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}
           cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ env.LIBCXX_TRIPLE }}/libc++_shared.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/
           cp ./target/${{ env.RUST_TARGET }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/${{ env.ANDROID_ABI }}/librustdesk.so
-          echo -n "${{ env.custom }}" | cat > ./flutter/assets/custom_.txt
           pushd flutter
           if [ "${{ env.PKG_FMT }}" = "aab" ]; then
-            # appbundle 单 abi(jniLibs 里只放了这个 abi 的 .so);产物固定 app-<reltype>.aab
             flutter build appbundle "--${{ env.RELTYPE }}" --target-platform ${{ env.TARGET_PLATFORM }}
             mv build/app/outputs/bundle/${{ env.RELTYPE }}/app-${{ env.RELTYPE }}.aab ../rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.aab
           else
@@ -419,47 +306,17 @@ jobs:
           mv ./rustdesk-${{ env.VERSION }}-${{ env.ARCH }}.${{ env.PKG_EXT }} ./signed-apk/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}
           ls -l signed-apk
 
-      # ── 收集产物 + custom_.txt ──────────────────────────────────────────────────────
       - name: Collect artifacts
         run: |
           set -e
           mkdir -p dist
           cp "./signed-apk/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}" dist/
-          cp ./custom_.txt "dist/${{ env.filename }}-custom_.txt"
+          cp ./custom.txt "dist/custom.txt"
           ls -l dist
 
-      #   照抄 linux:用 PRIVATE_TOKEN(有本 repo Contents:RW);github.token 默认只读发不了 Release。
-      #   只发实际产出的那一个产物(apk 或 aab)+ custom_.txt;file_url 指向带 arch 后缀的产物名。
-      - name: Publish Release
-        id: release
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
-        run: |
-          set -e
-          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
-          TAG="build-${{ inputs.taskid }}${SUF}"
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" dist/* \
-            --title "custom client ${{ inputs.taskid }}" \
-            --notes "自动构建 (android ${{ env.ARCH }} ${{ env.PKG_EXT }}, rustdesk ${VERSION})"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "file_url=${BASE}/${{ env.filename }}-${{ env.ARCH }}.${{ env.PKG_EXT }}" >> "$GITHUB_OUTPUT"
-
-  notify:
-    needs: [generate-bridge, build]
-    if: ${{ always() && inputs.callback_url != '' }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Notify
-        run: |
-          if [ "${{ needs.build.result }}" = "success" ]; then
-            STATUS="done"
-            FILE="${{ needs.build.outputs.file_url }}"
-          else
-            STATUS="error"
-            FILE=""
-          fi
-          echo "callback: status=$STATUS file=$FILE"
-          curl -s -X POST "${{ inputs.callback_url }}" \
-            -H 'Content-Type: application/json' \
-            -d "{\"taskid\":\"${{ inputs.taskid }}\",\"gen\":\"${{ inputs.gen }}\",\"status\":\"${STATUS}\",\"file\":\"${FILE}\"}" || true
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-custom-${{ env.filename }}-android-${{ env.ARCH }}-${{ env.PKG_EXT }}
+          path: dist/
+          if-no-files-found: error
