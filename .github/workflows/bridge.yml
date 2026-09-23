@@ -1,22 +1,20 @@
 name: Build flutter-rust-bridge
 # Build a RustDesk client. Build inputs are provided at build time.
 
+# 改编说明:原作(njfkib/rustdesk-build)从私有 fork 三分支拉取 "code" 源码,需要 PAT;
+# 本套件改为直接 clone 官方 rustdesk 1.4.9(公开仓库,免 PAT),patch 由本仓库注入。
+
 on:
   workflow_call:
     inputs:
       version:
-        description: '(optional)'
+        description: '(optional) rustdesk tag'
         required: false
         default: '1.4.9'
         type: string
-    secrets:
-      PRIVATE_TOKEN:
-        required: true
-      PRIVATE_REPO:
-        required: true
 
 # flutter pub get;1.4.9 的 pubspec 约束是 dart '^3.1.0',3.22.3 自带 dart 3.4 满足),
-# 主编译才用 3.24.5。frb codegen 版本 1.80.1、cargo-expand 1.0.95、rust 1.75 一律照抄。
+# 主编译才用 3.24.5。frb codegen 版本 1.80.1、cargo-expand 1.0.95、rust 1.75 一律照抄官方。
 env:
   CARGO_EXPAND_VERSION: "1.0.95"
   FLUTTER_VERSION: "3.22.3"
@@ -36,21 +34,26 @@ jobs:
               extra-build-args: "",
             }
     steps:
-      - name: Clone private RustDesk source (branch code)
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
-          PRIV: ${{ secrets.PRIVATE_REPO }}
+      # 本仓库(含 patch/apply-config.sh + config.json)checkout 到 custom/ 子目录,不污染源码根。
+      - name: Checkout custom build kit
+        uses: actions/checkout@v4
+        with:
+          path: custom
+
+      # 官方源码 → workspace 根(空目录,clone 进 .)+ submodule(hbb_common)。
+      - name: Clone RustDesk ${{ inputs.version }} source
         run: |
           set -e
-          git clone --depth 1 -b code \
-            "https://x-access-token:${GH_TOKEN}@github.com/${PRIV}.git" .
+          git clone --depth 1 --branch ${{ inputs.version }} https://github.com/rustdesk/rustdesk.git .
+          git -c submodule."libs/hbb_common".shallow=true submodule update --init --depth 1
           echo "source cloned: $(git rev-parse --short HEAD)"
+          test -f libs/hbb_common/src/config.rs && echo "submodule hbb_common OK"
 
       - name: Install prerequisites
         run: |
-          sudo apt-get install ca-certificates -y
           sudo apt-get update -y
           sudo apt-get install -y \
+            ca-certificates \
             clang \
             cmake \
             curl \
@@ -78,7 +81,7 @@ jobs:
 
       - name: Cache Bridge
         id: cache-bridge
-        uses: actions/cache@v4 # ★ rdgen 用 @v3(已被 GitHub 弃用),升 v4;key 原引用未定义的 matrix.job.arch(rdgen 遗留 bug,恒空)→ 改成已定义值
+        uses: actions/cache@v4
         with:
           path: /tmp/flutter_rust_bridge
           key: bridge-frb-${{ matrix.job.target }}
@@ -103,7 +106,7 @@ jobs:
           cp ./flutter/macos/Runner/bridge_generated.h ./flutter/ios/Runner/bridge_generated.h
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4 # ★ rdgen 用 @master(会漂移),钉 v4;与 build.yml 的 download-artifact@v4 同 major,可跨 job 取
+        uses: actions/upload-artifact@v4
         with:
           name: bridge-artifact
           path: |
