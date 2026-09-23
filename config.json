@@ -1,7 +1,7 @@
 {
   "appName": "RustDesk",
   "server": {
-    "host": "175g.cf",
+    "host": "http://175g.cf",
     "rendezvousPort": 21116,
     "relayPort": 21117,
     "key": "joaX2z6rQ9W8Yu6+ElpVb+1mjQVDsWkyFtIJc6c0t7U="
