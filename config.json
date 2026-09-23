@@ -1,0 +1,18 @@
+{
+  "appName": "RustDesk",
+  "server": {
+    "host": "175g.cf",
+    "rendezvousPort": 21116,
+    "relayPort": 21117,
+    "key": "joaX2z6rQ9W8Yu6+ElpVb+1mjQVDsWkyFtIJc6c0t7U="
+  },
+  "hide": {
+    "network": true,
+    "security": true,
+    "server": true,
+    "proxy": true,
+    "websocket": true,
+    "remotePrinter": true
+  },
+  "signMode": "delete"
+}
