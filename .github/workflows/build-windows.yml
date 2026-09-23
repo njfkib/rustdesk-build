@@ -1,39 +1,13 @@
 name: build-custom-client-windows
-run-name: build-windows ${{ inputs.taskid }}
-# Build a RustDesk client. Build inputs are provided at build time.
+run-name: build-windows ${{ inputs.arch == 'x86' && 'x86' || 'x86_64' }}
+# 编译一个把自建服务器地址和 Key 写死、且隐藏网络设置界面的 RustDesk 客户端(Windows 便携版 exe,可选 msi)
+# 改编自 njfkib/rustdesk-build .github/workflows/build-windows.yml;源码源改官方 1.4.9,免 PAT。
 
 on:
   workflow_dispatch:
     inputs:
-      taskid:
-        description: '构建任务 id'
-        required: true
-        type: string
-      gen:
-        description: '(optional)'
-        required: false
-        type: string
-        default: ''
-      callback_url:
-        description: '(optional)'
-        required: false
-        type: string
-        default: ''
-      # ── rdauth 给所有平台 workflow 统一派发这 4 个 dispatch 输入;本平台(windows)只实际消费 arch/msi。
-      #    distro(linux 包格式)/package_format(android apk/aab)在 windows 用不到,但【必须声明】——
-      #    否则 rdauth 携带该输入 dispatch 时 GitHub 会 422 拒绝(未声明的 input)。
       arch:
-        description: '(optional) CPU 架构: 空/x64 → x86_64-pc-windows-msvc(现状);x86 → i686-pc-windows-msvc(32位,不出 msi)'
-        required: false
-        type: string
-        default: ''
-      distro:
-        description: '(optional) linux 包格式;windows 不消费,仅为兼容 rdauth 统一派发而声明'
-        required: false
-        type: string
-        default: ''
-      package_format:
-        description: '(optional) android 包格式(apk/aab);windows 不消费,仅为兼容 rdauth 统一派发而声明'
+        description: '(optional) CPU 架构: 空/x64 → x86_64-pc-windows-msvc;x86 → i686-pc-windows-msvc(32位,不出 msi)'
         required: false
         type: string
         default: ''
@@ -44,31 +18,26 @@ on:
         default: 'false'
 
 permissions:
-  contents: write
+  contents: read
 
-# RUST 1.75 / FLUTTER 3.24.5 / LLVM 15.0.6 / VCPKG 120deac...)。VERSION 固定 1.4.9(我们的源码版本)。
+# RUST 1.75 / FLUTTER 3.24.5 / LLVM 15.0.6 / VCPKG 120deac...(与 njfkib 一致,官方 CI 同款)。
+# VERSION 固定 1.4.9(本套件的源码版本)。
 env:
-  RUST_VERSION: "1.75"          # sciter/1.78 有 i128 ABI 变更,rdgen 钉 1.75
+  RUST_VERSION: "1.75"          # sciter/1.78 有 i128 ABI 变更,钉 1.75
   FLUTTER_VERSION: "3.24.5"
   LLVM_VERSION: "15.0.6"
   VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b" # vcpkg 2024.07.12
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "1.4.9"
-  UPSTREAM_REF: "1.4.9"         # 补齐资源用的 pin 死上游 tag
 
 jobs:
-  # ── 先生成 flutter_rust_bridge(复用 ./.github/workflows/bridge.yml,与 Linux 一字不差)──
-  #   bridge 产物(.rs/.dart/.h)是平台无关的桥接代码,Windows 编译同样需要先 download 回源码树。
+  # ── 先生成 flutter_rust_bridge(复用 ./.github/workflows/bridge.yml)──
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
-    secrets: inherit
     with:
       version: '1.4.9'
 
-  # ── 主编译:windows → portable .exe (+ 可选 .msi) ─────────────────────────────────────
-  #    arch 由 inputs.arch 选:空/'x64' → x86_64-pc-windows-msvc(现状,完全向后兼容);
-  #                            'x86'    → i686-pc-windows-msvc(32位,vcpkg triplet 换 x86-windows-static,不出 msi)。
-  #    matrix.job.arch 仍是产物名后缀(x86_64 / x86),保持既有 filename-<arch>.exe 命名。
+  # ── 主编译:windows → portable .exe (+ 可选 .msi) ─────────────────────────
   build-windows:
     needs: generate-bridge
     name: build rustdesk windows ${{ inputs.arch == 'x86' && 'x86' || 'x86_64' }}
@@ -83,126 +52,47 @@ jobs:
               arch: "${{ inputs.arch == 'x86' && 'x86' || 'x86_64' }}",
               vcpkg-triplet: "${{ inputs.arch == 'x86' && 'x86-windows-static' || 'x64-windows-static' }}",
             }
-    outputs:
-      file_url: ${{ steps.release.outputs.file_url }}
     steps:
-      # ════════════════════════════════════════════════════════════════════════════════
-      # 前半段 = 通用外壳(从 Linux build.yml 逐字照搬,只在平台相关处加 `shell: bash` / 换补齐命令)
-      # ════════════════════════════════════════════════════════════════════════════════
+      # 本仓库(apply-config.sh + config.json)checkout 到 custom/ 子目录
+      - name: Checkout custom build kit
+        uses: actions/checkout@v4
+        with:
+          path: custom
 
-      #   源码 clone 到 workspace 根(空目录);patch/config clone 到 /tmp(Git Bash 的 /tmp,跨 step 持久)。
-      - name: Fetch build inputs
+      # 官方源码 → workspace 根(空目录,clone 进 .)+ submodule(hbb_common 必须,服务器/Key 常量在此)
+      - name: Clone RustDesk ${VERSION} source
         shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}
-          PRIV: ${{ secrets.PRIVATE_REPO }}
         run: |
           set -e
-          B="https://x-access-token:${GH_TOKEN}@github.com/${PRIV}.git"
-          # 源码 → workspace 根(空目录,可直接 clone 进 .)
-          git clone --depth 1 -b code "$B" .
-          # patch / config → /tmp
-          git clone --depth 1 -b patch  "$B" /tmp/patch
-          git clone --depth 1 -b config "$B" /tmp/cfg
-          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
-          cp "/tmp/cfg/configs/${{ inputs.taskid }}${SUF}.json" ./config.json
-          # 敏感配置值加掩码:appName/host/key 及其派生,一律不进公开 CI 日志
-          for _v in "$(jq -r '.appName // empty' config.json)" "$(jq -r '.server.host // empty' config.json)" "$(jq -r '.server.key // empty' config.json)"; do
+          git clone --depth 1 --branch ${VERSION} https://github.com/rustdesk/rustdesk.git .
+          git -c submodule."libs/hbb_common".shallow=true submodule update --init --depth 1
+          echo "source cloned: $(git rev-parse --short HEAD)"
+          test -f libs/hbb_common/src/config.rs && echo "submodule hbb_common OK"
+
+      # 从 config.json 计算 appname / filename → $GITHUB_ENV;敏感值加掩码
+      - name: Compute appname/filename from config.json
+        shell: bash
+        run: |
+          set -e
+          APP=$(jq -r '.appName // "RustDesk"' custom/config.json)
+          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=rustdesk
+          echo "appname=$APP"   >> "$GITHUB_ENV"
+          echo "filename=$SAFE" >> "$GITHUB_ENV"
+          for _v in "$(jq -r '.appName // empty' custom/config.json)" "$(jq -r '.server.host // empty' custom/config.json)" "$(jq -r '.server.key // empty' custom/config.json)"; do
             [ -n "$_v" ] && echo "::add-mask::$_v"
           done
 
-      # ── 从 config.json 计算 appname / compname / filename → $GITHUB_ENV ──
-      #      安全文件名(仅 alnum._-);appname/compname 供后续 Windows 专属 sed 与打包步骤使用。
-      - name: Compute appname/compname/filename from config.json
+      # ── 核心注入:host/key 写死进 hbb_common/src/config.rs,删 custom.txt 签名校验,
+      #    生成 custom.txt(含 override-settings:hide-network-settings 等)。──
+      - name: Apply configuration + generate custom.txt
         shell: bash
         run: |
           set -e
-          APP=$(jq -r '.appName // "RustDesk"' config.json)
-          COMP=$(jq -r '.companyName // "Purslane Ltd"' config.json)
-          SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=rustdesk
-          echo "appname=$APP"   >> "$GITHUB_ENV"
-          echo "compname=$COMP" >> "$GITHUB_ENV"
-          echo "filename=$SAFE" >> "$GITHUB_ENV"
-
-      #   flutter 编译 + Runner.rc 资源 + portable/msi 打包都会用到,不补齐必然失败。
-      #   ★ Linux 用 rsync --ignore-existing;Windows 的 Git Bash 未必带 rsync,退化到 `cp -rn`(无 rsync 时)。
-      - name: Restore resources
-        shell: bash
-        run: |
-          set -e
-          git clone --depth 1 --branch "${UPSTREAM_REF}" https://github.com/rustdesk/rustdesk.git /tmp/up
-          rm -rf /tmp/up/.git
-          if command -v rsync >/dev/null 2>&1; then
-            rsync -a --ignore-existing /tmp/up/ ./
-          else
-            # cp -rn:递归、no-clobber(只补缺失、绝不覆盖已有源码);best-effort
-            cp -rn /tmp/up/. ./ 2>/dev/null || true
-          fi
-          rm -rf /tmp/up
-          echo "已补齐资源;抽查: $(ls -1 res/icon.ico res/32x32.png flutter/assets/icon.svg .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff 2>&1 | tr '\n' ' ')"
-
-      #   注入 host/key/api/appname/公司名/官网/下载/验签处理,并生成 ./_custom_client.json。
-      #   ★ 用 `bash <脚本>` 调用,避免 Windows NTFS 上执行位不可靠导致 permission denied。
-      - name: Apply configuration
-        shell: bash
-        run: |
-          set -e
-          chmod +x /tmp/patch/*.sh 2>/dev/null || true
-          bash /tmp/patch/apply-config.sh "$PWD" "$PWD/config.json"
-
-      # ── ImageMagick(apply-icons.sh 用 magick/convert 生成 res/icon.ico 等各尺寸图标)──
-      #   照抄 rdgen 写法:装完把 ImageMagick 目录追加进 $GITHUB_PATH,供后续 Git Bash 步骤调用。
-      - name: Install ImageMagick
-        shell: pwsh
-        run: |
-          choco install -y imagemagick.app --no-progress
-          Get-ChildItem -Path "${env:ProgramFiles}" | % { $_.FullName } | Select-String -Pattern "[\\/]ImageMagick[^\\/]*$" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-
-      # ── 注入自定义应用图标 / 首页 Logo(config.json 的 base64 → res/icon.* + flutter/assets/logo.svg)──
-      #   ★ 必须在 "Restore resources"(补齐上游默认图标)之后,自定义图标才能覆盖上游默认图标。
-      - name: Apply icons
-        shell: bash
-        run: |
-          set -e
-          bash /tmp/patch/apply-icons.sh "$PWD" "$PWD/config.json"
-
-      # ── 生成 custom_.txt(base64(_custom_client.json);打包时放进 ./rustdesk 供客户端读取)──
-      #   signMode=delete:apply-config 已删验签,直接 base64(json) 即可被客户端接受。
-      #   signMode=swapkey:TODO(v1)加 SIGN_PRIVKEY 对 _custom_client.json 签名后再 base64。
-      - name: Generate config blob
-        shell: bash
-        run: |
-          set -e
-          MODE=$(jq -r '.signMode // "delete"' config.json)
-          if [ "$MODE" = "swapkey" ]; then
-            echo "::warning::signMode=swapkey 尚未实现签名(需 SIGN_PRIVKEY);v0 先按未签处理"
-          fi
-          base64 -w0 ./_custom_client.json > ./custom_.txt
-          echo "custom_.txt 生成: $(wc -c < ./custom_.txt) 字节"
-
-      # ── 导出 GitHub Actions cache 环境变量(供 vcpkg x-gha 二进制缓存)──
-      - name: Export GitHub Actions cache environment variables
-        uses: actions/github-script@v7 # ★ rdgen 用 @v6(已弃用),升 v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      # ── Restore bridge files(从 generate-bridge 的 bridge-artifact 下载还原到源码树)──
-      - name: Restore bridge files
-        uses: actions/download-artifact@v4 # ★ 钉 v4(配 bridge 的 upload-artifact@v4)
-        with:
-          name: bridge-artifact
-          path: ./
-
-      # ════════════════════════════════════════════════════════════════════════════════
-      # ════════════════════════════════════════════════════════════════════════════════
-
-      - name: fix flutter_gpu_texture_renderer (fixed in master rustdesk)
-        shell: bash
-        run: |
-          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.lock || true
-          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.yaml || true
+          bash ./custom/patch/apply-config.sh "$PWD" "$PWD/custom/config.json"
+          echo "--- 注入后抽查 ---"
+          grep -n 'RENDEZVOUS_SERVERS\|RS_PUB_KEY' libs/hbb_common/src/config.rs | head -4
+          grep -c 'signMode=delete' src/common.rs
+          ls -l custom.txt
 
       # ── ★ Windows 专属改名(apply-config.sh 不碰 flutter/windows/runner/Runner.rc 与 res/msi)──
       - name: change appname (windows runner resource)
@@ -210,15 +100,13 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          # ./flutter/windows/runner/Runner.rc(exe 版本资源:ProductName/FileDescription/InternalName/OriginalFilename)
           sed -i -e 's|"RustDesk Remote Desktop"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc || true
           sed -i -e 's|VALUE "InternalName", "rustdesk" "\0"|VALUE "InternalName", "${{ env.appname }}" "\0"|' ./flutter/windows/runner/Runner.rc || true
           sed -i -e 's|"rustdesk.exe"|"${{ env.filename }}.exe"|' ./flutter/windows/runner/Runner.rc || true
           sed -i -e 's|"RustDesk"|"${{ env.appname }}"|' ./flutter/windows/runner/Runner.rc || true
-          # ./res/msi/Package/License.rtf
           sed -i -e 's|RustDesk|${{ env.appname }}|' ./res/msi/Package/License.rtf 2>/dev/null || true
 
-      # ── ★ 含空格 appname 的注册表引号修复(src/platform/windows.rs);apply-config 不覆盖 ──
+      # ── ★ 含空格 appname 的注册表引号修复(src/platform/windows.rs)──
       - name: fix registry if appname has a space
         if: contains(env.appname, ' ')
         continue-on-error: true
@@ -226,34 +114,30 @@ jobs:
         run: |
           sed -i -e 's|reg add {}|reg add \\\"{}\\\"|' ./src/platform/windows.rs
           sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext} /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\DefaultIcon /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\DefaultIcon\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open /f|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\\command|reg add \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\\shell\\\\open\\\\command\\\"|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext} /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg add HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\\command /f|reg add \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\\shell\\\\open\\\\command\\\" /f|' ./src/platform/windows.rs
           sed -i -e 's|{subkey}|\\\"{subkey}\\\"|' ./src/platform/windows.rs
           sed -i -e 's|reg delete HKEY_CLASSES_ROOT\\\\.{ext} /f|reg delete \\\"HKEY_CLASSES_ROOT\\\\.{ext}\\\" /f|' ./src/platform/windows.rs
-          sed -i -e 's|reg delete HKEY_CLASSES_ROOT\\\\{ext} /f|reg delete \\\"HKEY_CLASSES_ROOT\\\\{ext}\\\" /f|' ./src/platform/windows.rs
 
-      # ── ★ Windows 专属公司名改名(Runner.rc / res/msi);apply-config 只改 dart/Cargo/main.rs ──
-      - name: change company name (windows runner resource / msi)
-        if: env.compname != 'Purslane Ltd'
-        continue-on-error: true
+      # ── Export GitHub Actions cache environment variables(vcpkg x-gha 二进制缓存)──
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      # ── Restore bridge files(从 generate-bridge 下载还原到源码树)──
+      - name: Restore bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: fix flutter_gpu_texture_renderer (fixed in master rustdesk)
         shell: bash
         run: |
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/windows/runner/Runner.rc || true
-          sed -i -e 's|Purslane Ltd|${{ env.compname }}|'          ./flutter/windows/runner/Runner.rc || true
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./res/msi/preprocess.py || true
-          sed -i -e 's|r"Purslane(?: Tech Pte\.)? Ltd"|"${{ env.compname }}"|' ./res/msi/preprocess.py || true
-          sed -i -e 's|PURSLANE|${{ env.compname }}|'              ./res/msi/preprocess.py || true
-          sed -i -e 's|Purslane Ltd|${{ env.compname }}|'          ./res/msi/preprocess.py || true
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./res/msi/Package/License.rtf || true
-          sed -i -e 's|Purslane Ltd|${{ env.compname }}|'          ./res/msi/Package/License.rtf || true
+          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.lock || true
+          sed -i -e 's|2ded7f146437a761ffe6981e2f742038f85ca68d|08a471bb8ceccdd50483c81cdfa8b81b07b14b87|' ./flutter/pubspec.yaml || true
 
-      # ── LLVM/Clang(bindgen 需要)──
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v1
         with:
@@ -275,7 +159,6 @@ jobs:
           mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
 
       # ── flutter 3.24.5 的 dropdown_menu enableFilter 补丁(上游 rustdesk 自家 CI 也打)──
-      #   补丁文件由“资源补齐”从上游 1.4.9 补回 .github/patches;robust:文件缺失/已应用都不致命。
       - name: Patch flutter
         shell: bash
         run: |
@@ -327,33 +210,24 @@ jobs:
           fi
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ matrix.job.vcpkg-triplet }}-rel-out.log" || true
 
-      # ── 据自定义 res/icon.png 重生成各平台 flutter 图标(pubspec flutter_icons.image_path=../res/icon.png)──
-      #   best-effort:装不上/跑不通不阻断构建(Rust 侧 res/icon.ico 已给 exe/托盘自定义图标)。
-      - name: Regenerate flutter icons
-        continue-on-error: true
-        shell: bash
-        run: |
-          cd flutter && flutter pub get && (dart run flutter_launcher_icons || flutter pub run flutter_launcher_icons || true)
-
       # ── 核心编译:build.py 出 flutter runner Release + 附带 usbmmidd 虚拟显示器驱动 ──
       - name: Build rustdesk (cargo + flutter runner)
         run: |
           python3 .\build.py --portable --hwcodec --flutter --vram --skip-portable-pack
           mv ./flutter/build/windows/x64/runner/Release ./rustdesk
 
-          # usbmmidd_v2(虚拟显示器,rustdesk 打包进产物目录)
           Invoke-WebRequest -Uri https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip -OutFile usbmmidd_v2.zip
           Expand-Archive usbmmidd_v2.zip -DestinationPath . -Force
           Remove-Item -Path usbmmidd_v2\Win32 -Recurse
           Remove-Item -Path "usbmmidd_v2\deviceinstaller64.exe", "usbmmidd_v2\deviceinstaller.exe", "usbmmidd_v2\usbmmidd.bat"
           mv -Force .\usbmmidd_v2 ./rustdesk
 
-      # ── 把 custom_.txt 放进产物目录(portable/msi 打包都会连带打进去,客户端启动读取)──
-      - name: Generate config blob
+      # ── 把 custom.txt 放进产物目录(portable/msi 打包都会连带打进去,客户端启动读取)──
+      - name: Embed custom.txt into bundle
         shell: bash
         run: |
-          cp ./custom_.txt ./rustdesk/custom_.txt
-          ls -l ./rustdesk/custom_.txt
+          cp ./custom.txt ./rustdesk/custom.txt
+          ls -l ./rustdesk/custom.txt
 
       # ── 取 Runner.res(含真实版本信息;portable packer 需要嵌入)──
       - name: find Runner.res
@@ -370,12 +244,13 @@ jobs:
           fi
 
       # ── 打 portable 自解压 exe(libs/portable/generate.py)──
-      #   ★ appname 来源改为 env.appname;签名步骤全删,直接产出 ./SignOutput/rustdesk.exe。
       - name: Build self-extracted executable
         shell: bash
         run: |
           set -e
-          mv "./rustdesk/rustdesk.exe" "./rustdesk/${{ env.appname }}.exe" || echo "rustdesk.exe"
+          if [ "${{ env.appname }}" != "RustDesk" ]; then
+            mv "./rustdesk/rustdesk.exe" "./rustdesk/${{ env.appname }}.exe"
+          fi
           sed -i '/dpiAware/d' res/manifest.xml || true
           pushd ./libs/portable
           pip3 install -r requirements.txt
@@ -385,8 +260,7 @@ jobs:
           mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/rustdesk.exe"
           ls -l ./SignOutput/
 
-      # ── (可选)WiX 打 msi;仅当 inputs.msi=='true' 且非 x86 时才打(x86 32位强制不打 msi)。
-      #    默认 msi='false' → 跳过,只出 portable exe。打 msi 仍 best-effort(continue-on-error),失败不影响 exe 交付。
+      # ── (可选)WiX 打 msi;仅当 inputs.msi=='true' 且非 x86 时打(默认跳过,只出 portable exe)──
       - name: Add MSBuild to PATH
         if: ${{ inputs.msi == 'true' && inputs.arch != 'x86' }}
         uses: microsoft/setup-msbuild@v2
@@ -404,57 +278,26 @@ jobs:
           cp ./Package/bin/x64/Release/en-us/Package.msi ../../SignOutput/rustdesk.msi
           popd
 
-      # ── 收集 + 改名产物(exe 必有;msi best-effort;附 custom_.txt)──
+      # ── 收集 + 命名产物(exe 必有;msi best-effort;附 custom.txt)──
       - name: Collect artifacts
         shell: bash
         run: |
           set -e
           mkdir -p dist
-          # portable exe(SignOutput/rustdesk.exe → filename.exe)
           if [ -f "./SignOutput/rustdesk.exe" ]; then
             mv "./SignOutput/rustdesk.exe" "./SignOutput/${{ env.filename }}.exe"
           fi
           cp "./SignOutput/${{ env.filename }}.exe" "dist/${{ env.filename }}-${{ matrix.job.arch }}.exe"
-          # msi(可选)
           if [ -f "./SignOutput/rustdesk.msi" ]; then
             mv "./SignOutput/rustdesk.msi" "./SignOutput/${{ env.filename }}.msi" || true
             cp "./SignOutput/${{ env.filename }}.msi" "dist/${{ env.filename }}-${{ matrix.job.arch }}.msi" || true
           fi
-          # custom_.txt 随产物发布
-          cp ./custom_.txt "dist/${{ env.filename }}-custom_.txt" || true
+          cp ./custom.txt "dist/custom.txt" || true
           ls -l dist
 
-      - name: Publish Release
-        id: release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.PRIVATE_TOKEN }}  # ★ 用 PAT(有本 repo Contents:RW);github.token 默认只读发不了 Release(404)
-        run: |
-          set -e
-          SUF=""; [ -n "${{ inputs.gen }}" ] && SUF="-${{ inputs.gen }}"
-          TAG="build-${{ inputs.taskid }}${SUF}"
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" dist/* \
-            --title "custom client ${{ inputs.taskid }} (windows)" \
-            --notes "自动构建 (windows ${{ matrix.job.arch }}, rustdesk ${VERSION})"
-          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
-          echo "file_url=${BASE}/${{ env.filename }}-${{ matrix.job.arch }}.exe" >> "$GITHUB_OUTPUT"
-
-  notify:
-    needs: [generate-bridge, build-windows]
-    if: ${{ always() && inputs.callback_url != '' }}
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Notify
-        run: |
-          if [ "${{ needs.build-windows.result }}" = "success" ]; then
-            STATUS="done"
-            FILE="${{ needs.build-windows.outputs.file_url }}"
-          else
-            STATUS="error"
-            FILE=""
-          fi
-          echo "callback: status=$STATUS file=$FILE"
-          curl -s -X POST "${{ inputs.callback_url }}" \
-            -H 'Content-Type: application/json' \
-            -d "{\"taskid\":\"${{ inputs.taskid }}\",\"gen\":\"${{ inputs.gen }}\",\"status\":\"${STATUS}\",\"file\":\"${FILE}\"}" || true
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-custom-${{ env.filename }}-windows-${{ matrix.job.arch }}
+          path: dist/
+          if-no-files-found: error
