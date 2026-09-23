@@ -16,7 +16,7 @@
     "host": "175g.cf",
     "rendezvousPort": 21116,
     "relayPort": 21117,
-    "key": "joaX2z6rQ9W8Yu6+ElpVb+1mjQVDsWkyFtIJc6c0t7U="
+    "key": "joaX2z6rQ9W8Yu6+ElpVb+1mjQVsDsWkyFtIJc6c0t7U="
   },
   "hide": {
     "network": true,
