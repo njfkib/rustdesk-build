@@ -26,7 +26,7 @@ env:
   RUST_VERSION: "1.75"          # sciter/1.78 有 i128 ABI 变更,钉 1.75
   FLUTTER_VERSION: "3.24.5"
   LLVM_VERSION: "15.0.6"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b" # vcpkg 2024.07.12
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d" # vcpkg 2024.07.12
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
   VERSION: "1.4.9"
 
