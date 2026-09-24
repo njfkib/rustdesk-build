@@ -95,7 +95,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          APP=$(jq -r '.appName // "RustDesk"' custom/config.json)
+          APP=$(jq -r '.appName // "RDesk"' custom/config.json)
           SAFE=$(printf '%s' "$APP" | tr -cd '[:alnum:]._-'); [ -z "$SAFE" ] && SAFE=custom
           echo "appname=$APP"   >> "$GITHUB_ENV"
           echo "filename=$SAFE" >> "$GITHUB_ENV"
