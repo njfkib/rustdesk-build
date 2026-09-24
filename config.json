@@ -1,5 +1,5 @@
 {
-  "appName": "RustDesk",
+  "appName": "RDesk",
   "server": {
     "host": "http://175g.cf",
     "rendezvousPort": 21116,
